@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Karnali Province - Health Facilities WebGIS</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <!-- Leaflet Routing Machine CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.css"/>
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; }
+    #map { width: 100vw; height: 100vh; }
+    .sidebar {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 9999;
+      background: rgba(255,255,255,0.95);
+      padding: 18px 14px 18px 14px;
+      border-radius: 7px;
+      box-shadow: 0 0 16px rgba(0,0,0,0.18);
+      max-width: 350px;
+      font-family: Arial, sans-serif;
+    }
+    .sidebar h2 {
+      margin-top: 0;
+      font-size: 1.2em;
+      margin-bottom: 0.7em;
+    }
+    .spatial-tool-section { margin-bottom: 16px; }
+    .legend {
+      margin-top: 10px;
+      font-size: 0.95em;
+    }
+    .legend span {
+      display: inline-block;
+      width: 14px; height: 14px;
+      vertical-align: middle;
+      margin-right: 4px;
+      border-radius: 2px;
+      margin-top: 2px;
+    }
+    button {
+      background: #1e90ff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 1em;
+    }
+    button:disabled {
+      background: #bbb;
+      cursor: not-allowed;
+    }
+    select, input[type="number"] {
+      padding: 3px 7px;
+      font-size: 1em;
+      border-radius: 3px;
+      border: 1px solid #ccc;
+      margin-top: 3px;
+      margin-bottom: 3px;
+    }
+    label { font-weight: 500; }
+    .leaflet-control-layers {
+      font-size: 1em;
+    }
+  </style>
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <!-- Leaflet Routing Machine -->
+  <script src="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.js"></script>
+  <!-- Turf.js for spatial analysis -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+</head>
+<body>
+<div class="sidebar">
+  <h2>Karnali Health Facilities GIS</h2>
+  <div class="spatial-tool-section">
+    <label>
+      <b>1. Walking Distance to Nearest Facility</b><br>
+      <span style="font-size:0.95em;">
+        Facility type:
+        <select id="facilityType">
+          <option value="all">All</option>
+          <option value="hospital">Hospital</option>
+          <option value="healthpost">Health Post</option>
+          <option value="clinic">Clinic</option>
+        </select>
+      </span>
+    </label><br>
+    <button id="locateBtn">Find My Location & Route</button>
+    <div id="distanceResult"></div>
+  </div>
+  <div class="spatial-tool-section">
+    <label>
+      <b>2. Buffer Analysis</b><br>
+      Select buffer radius (km):<br>
+    </label>
+    <input type="number" id="bufferRadius" min="1" max="20" value="3" style="width: 60px;">
+    <button id="bufferBtn">Show Buffer Around Hospitals</button>
+    <div id="bufferResult"></div>
+  </div>
+  <div class="spatial-tool-section">
+    <label>
+      <b>3. Facility Count by District</b>
+    </label><br>
+    <select id="districtSelect"></select>
+    <button id="countBtn">Count Facilities</button>
+    <div id="countResult"></div>
+  </div>
+  <div class="legend">
+    <b>Legend:</b><br>
+    <span style="background:#444"></span> Province Boundary<br>
+    <span style="background:#aaa"></span> Local Levels<br>
+    <span style="background:#4daf4a"></span> Districts<br>
+    <span style="background:#e41a1c"></span> Hospital<br>
+    <span style="background:#377eb8"></span> Health Post<br>
+    <span style="background:#984ea3"></span> Clinic<br>
+    <span style="background:#ff7f00"></span> Your Location<br>
+    <span style="background:#377eb8; opacity:0.5"></span> Buffer Zone<br>
+  </div>
+</div>
+<div id="map"></div>
+<script>
+// ---- 1. Map Initialization ----
+const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '© OpenStreetMap contributors'
+});
+
+const topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+  maxZoom: 17,
+  attribution: '© OpenTopoMap contributors, © OpenStreetMap contributors'
+});
+
+const esriWorldImagery = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  {
+    attribution: 'Tiles © Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+  }
+);
+
+const baseLayers = {
+  "OpenStreetMap": osm,
+  "Topo Map": topo,
+  "Satellite (Esri)": esriWorldImagery
+};
+
+const map = L.map('map', {
+  center: [29.35, 82.25],
+  zoom: 8,
+  layers: [osm]
+});
+
+L.control.layers(baseLayers, null, {collapsed: false, position: 'topright'}).addTo(map);
+
+// --- Province, Districts, Local Levels ---
+let provinceLayer, districtsLayer, localLevelsLayer, highlightDistrictLayer, bufferGeojsonLayer;
+let hospitalMarkers = L.layerGroup().addTo(map);
+let healthPostMarkers = L.layerGroup().addTo(map);
+let clinicMarkers = L.layerGroup().addTo(map);
+let currentLocationMarker, routingControl;
+let hospitals = [], healthposts = [], clinics = [], allFacilities = [];
+let districtFeatures = [];
+
+// Province boundary
+fetch('province_karnali.geojson')
+  .then(res => res.json())
+  .then(data => {
+    provinceLayer = L.geoJSON(data, {
+      style: {color: "#444", weight: 3, fill: false}
+    }).addTo(map);
+  });
+
+// Districts
+fetch('districts_karnali.geojson')
+  .then(res => res.json())
+  .then(data => {
+    districtsLayer = L.geoJSON(data, {
+      style: {color: "#4daf4a", weight: 1.5, fill: false},
+      onEachFeature: function (feature, layer) {
+        districtFeatures.push(feature);
+        layer.bindPopup('<b>District:</b> ' + (feature.properties.DISTRICT || feature.properties.name));
+      }
+    }).addTo(map);
+
+    // Populate district select
+    const select = document.getElementById('districtSelect');
+    data.features.forEach((f, i) => {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.text = f.properties.DISTRICT || f.properties.name || `District ${i+1}`;
+      select.appendChild(opt);
+    });
+  });
+
+// Local levels
+fetch('local_levels_karnali.geojson')
+  .then(res => res.json())
+  .then(data => {
+    localLevelsLayer = L.geoJSON(data, {
+      style: {color: "#aaa", weight: 1, fill: false, dashArray: '3,6'},
+      onEachFeature: function (feature, layer) {
+        if (feature.properties && feature.properties.LL_NAME) {
+          layer.bindPopup('<b>Local Level:</b> ' + feature.properties.LL_NAME);
+        }
+      }
+    }).addTo(map);
+  });
+
+// --- 2. Health Facilities Data ---
+fetch('hospitals_karnali.geojson')
+  .then(res => res.json())
+  .then(data => {
+    data.features.forEach(f => {
+      let coords = f.geometry.coordinates;
+      let latlng = [coords[1], coords[0]];
+      let name = f.properties.VDC_NAME1 || f.properties.name || "Unnamed";
+      let typeRaw = (f.properties.HF_TYPE || '').toLowerCase().trim();
+      let dist = f.properties.DIST_NAME || '';
+      let type;
+      // Normalize type for selection and legend
+      if (typeRaw === "hospital") {
+        type = "hospital";
+        hospitals.push(f);
+        allFacilities.push({feature: f, type: "hospital", latlng: latlng});
+        L.circleMarker(latlng, {
+          radius: 8, fillColor: "#e41a1c", color: "#fff", weight: 1, fillOpacity: 0.92
+        })
+        .bindPopup('<b>Hospital</b><br>' + name + "<br><b>District:</b> " + dist)
+        .addTo(hospitalMarkers);
+      } else if (typeRaw === "health post" || typeRaw === "healthpost" || typeRaw === "health_post") {
+        type = "healthpost";
+        healthposts.push(f);
+        allFacilities.push({feature: f, type: "healthpost", latlng: latlng});
+        L.circleMarker(latlng, {
+          radius: 7, fillColor: "#377eb8", color: "#fff", weight: 1, fillOpacity: 0.80
+        })
+        .bindPopup('<b>Health Post</b><br>' + name + "<br><b>District:</b> " + dist)
+        .addTo(healthPostMarkers);
+      } else if (typeRaw === "clinic") {
+        type = "clinic";
+        clinics.push(f);
+        allFacilities.push({feature: f, type: "clinic", latlng: latlng});
+        L.circleMarker(latlng, {
+          radius: 7, fillColor: "#984ea3", color: "#fff", weight: 1, fillOpacity: 0.77
+        })
+        .bindPopup('<b>Clinic</b><br>' + name + "<br><b>District:</b> " + dist)
+        .addTo(clinicMarkers);
+      } else {
+        // If you have more types, add them here as needed
+        allFacilities.push({feature: f, type: typeRaw, latlng: latlng});
+      }
+    });
+  })
+  .catch(() => {
+    alert('Failed to load hospitals_karnali.geojson. Please provide your own file with correct structure.');
+  });
+
+// ---- 3. Walking Distance to Facility ----
+document.getElementById('locateBtn').onclick = function() {
+  if (currentLocationMarker) map.removeLayer(currentLocationMarker);
+  if (routingControl) map.removeControl(routingControl);
+
+  let facilityType = document.getElementById('facilityType').value;
+  navigator.geolocation.getCurrentPosition(function(pos) {
+    const latlng = [pos.coords.latitude, pos.coords.longitude];
+    currentLocationMarker = L.circleMarker(latlng, {
+      radius: 8, fillColor: "#ff7f00", color: "#fff", weight: 2, fillOpacity: 1
+    }).addTo(map)
+      .bindPopup("<b>Your Location</b>").openPopup();
+    map.setView(latlng, 12);
+
+    // Select which facilities to search
+    let searchArr;
+    if (facilityType === "hospital") searchArr = hospitals.map(f => ({feature: f, latlng: [f.geometry.coordinates[1], f.geometry.coordinates[0]]}));
+    else if (facilityType === "healthpost") searchArr = healthposts.map(f => ({feature: f, latlng: [f.geometry.coordinates[1], f.geometry.coordinates[0]]}));
+    else if (facilityType === "clinic") searchArr = clinics.map(f => ({feature: f, latlng: [f.geometry.coordinates[1], f.geometry.coordinates[0]]}));
+    else searchArr = allFacilities;
+
+    // Find nearest
+    let minDist = Infinity, nearest = null, nearestLatLng = null, nearestType = '', nearestName = '';
+    searchArr.forEach(obj => {
+      let f = obj.feature;
+      let latlng2 = obj.latlng;
+      let dist = turf.distance(turf.point([latlng[1], latlng[0]]), turf.point([latlng2[1], latlng2[0]]), {units: 'kilometers'});
+      if (dist < minDist) {
+        minDist = dist;
+        nearest = f;
+        nearestLatLng = latlng2;
+        nearestType = (f.properties.HF_TYPE || '').trim();
+        nearestName = (f.properties.VDC_NAME1 || f.properties.name || "Unnamed");
+      }
+    });
+
+    // Routing (walking)
+    if (nearestLatLng) {
+      routingControl = L.Routing.control({
+        waypoints: [L.latLng(latlng), L.latLng(nearestLatLng)],
+        lineOptions: {
+          styles: [{color: '#e41a1c', weight: 6, opacity: 0.78}]
+        },
+        router: L.Routing.osrmv1({serviceUrl: 'https://router.project-osrm.org/route/v1'}),
+        profile: 'foot',
+        fitSelectedRoutes: true,
+        show: false,
+        addWaypoints: false,
+        draggableWaypoints: false
+      }).addTo(map)
+        .on('routesfound', function(e) {
+          let r = e.routes[0];
+          document.getElementById('distanceResult').innerHTML =
+            `<span style="color:#1e90ff"><b>Nearest: </b>${nearestType} <b>${nearestName}</b><br>
+            <b>Walking distance:</b> ${(r.summary.totalDistance/1000).toFixed(2)} km<br>
+            <b>Estimated time:</b> ${Math.round(r.summary.totalTime/60)} min</span>`;
+        });
+    } else {
+      document.getElementById('distanceResult').innerHTML =
+        '<span style="color:red">No facility found in data.</span>';
+    }
+  }, function() {
+    alert("Could not get your location.");
+  });
+};
+
+// ---- 4. Buffer Analysis ----
+document.getElementById('bufferBtn').onclick = function() {
+  if (bufferGeojsonLayer) map.removeLayer(bufferGeojsonLayer);
+
+  let radius = parseFloat(document.getElementById('bufferRadius').value);
+  if (isNaN(radius) || radius < 0.1) {
+    alert("Please enter valid buffer radius.");
+    return;
+  }
+
+  // Turf: buffer all hospitals
+  let coll = turf.featureCollection(hospitals.map(f => {
+    return turf.point(f.geometry.coordinates, f.properties);
+  }));
+  let buffer = turf.buffer(coll, radius, {units: 'kilometers'});
+  bufferGeojsonLayer = L.geoJSON(buffer, {
+    style: {color:"#377eb8",fillColor:"#377eb8",fillOpacity:0.22,weight:2,opacity:0.75}
+  }).addTo(map);
+
+  document.getElementById('bufferResult').innerHTML =
+    `<span style="color:#377eb8">Buffer of ${radius} km shown around all hospitals.</span>`;
+  map.fitBounds(bufferGeojsonLayer.getBounds());
+};
+
+// ---- 5. Facility Count by District ----
+document.getElementById('countBtn').onclick = function() {
+  const idx = document.getElementById('districtSelect').value;
+  if (!districtFeatures[idx]) return;
+  if (highlightDistrictLayer) map.removeLayer(highlightDistrictLayer);
+
+  highlightDistrictLayer = L.geoJSON(districtFeatures[idx], {
+    style: {color: "#4daf4a", weight: 3, fillOpacity: 0.07, dashArray: "3,7"}
+  }).addTo(map);
+
+  // Count health facilities within district
+  const districtPolygon = districtFeatures[idx];
+  let hospitalCount = 0, hpCount = 0, clinicCount = 0;
+  hospitals.forEach(f => {
+    let pt = turf.point(f.geometry.coordinates);
+    if (turf.booleanPointInPolygon(pt, districtPolygon)) hospitalCount++;
+  });
+  healthposts.forEach(f => {
+    let pt = turf.point(f.geometry.coordinates);
+    if (turf.booleanPointInPolygon(pt, districtPolygon)) hpCount++;
+  });
+  clinics.forEach(f => {
+    let pt = turf.point(f.geometry.coordinates);
+    if (turf.booleanPointInPolygon(pt, districtPolygon)) clinicCount++;
+  });
+
+  document.getElementById('countResult').innerHTML =
+    `<span style="color:#e41a1c"><b>${hospitalCount}</b> Hospital(s)</span>, ` +
+    `<span style="color:#377eb8"><b>${hpCount}</b> Health Post(s)</span>, ` +
+    `<span style="color:#984ea3"><b>${clinicCount}</b> Clinic(s)</span> found in this district.`;
+  map.fitBounds(highlightDistrictLayer.getBounds());
+};
+
+// ---- 6. UX: Remove buffer or highlight layers on map click ----
+map.on('click', function() {
+  if (bufferGeojsonLayer) map.removeLayer(bufferGeojsonLayer);
+  if (highlightDistrictLayer) map.removeLayer(highlightDistrictLayer);
+});
+</script>
+</body>
+</html>
